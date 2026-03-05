@@ -151,20 +151,22 @@ aggregate_short_borrows <- function(short_borrow, universe_tickers) {
 #' gross exposure on each side (long/short) via iterative rescaling.
 apply_max_weight_ls <- function(df, max_weight = 0.05, max_iter = 20) {
   for (i in seq_len(max_iter)) {
-    if (!any(abs(df$weight) > max_weight + 1e-9)) break
+    if (!any(abs(df$weight) > max_weight + 1e-9, na.rm = TRUE)) break
 
     df <- df %>%
       mutate(side = sign(weight)) %>%
+      filter(side != 0) %>%
       group_by(date, side) %>%
       mutate(
         original_gross = sum(abs(weight)),
         capped = sign(weight) * pmin(abs(weight), max_weight),
         weight = capped * original_gross / sum(abs(capped))
       ) %>%
-      ungroup()
+      ungroup() %>%
+      bind_rows(df %>% filter(sign(weight) == 0))
   }
 
-  if (any(abs(df$weight) > max_weight + 1e-9)) {
+  if (any(abs(df$weight) > max_weight + 1e-9, na.rm = TRUE)) {
     warning("Max iterations reached, some weights still exceed cap")
   }
 
