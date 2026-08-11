@@ -145,6 +145,67 @@ aggregate_short_borrows <- function(short_borrow, universe_tickers) {
 
 # ── Simulation Helpers ───────────────────────────────────────────────────────
 
+#' Sort the asset columns of a wide simulation matrix
+#'
+#' `rsims::min_commission_backtest()` sorts `short_borrow_costs` by name and then
+#' applies it *positionally* to the asset columns. But `tidyr::pivot_wider()` names
+#' columns in order of FIRST APPEARANCE, so any ticker that had not listed on the
+#' first date of the simulation lands out of alphabetical order — and every asset
+#' after it receives a different ticker's borrow rate. On a US equity universe
+#' starting in 2020 that is most of the book, with a mean error of several hundred
+#' basis points of annual borrow cost.
+#'
+#' Apply this to the weights, adjusted-price and unadjusted-price matrices — all
+#' three, so they stay consistent with each other — before calling the backtest.
+#' It is a no-op under a future rsims that matches borrow costs by name.
+#'
+#' @param m A wide matrix whose first column is `date` and whose remaining columns
+#'   are tickers.
+#' @return `m` with the asset columns in `sort()` order. `sort()` deliberately, to
+#'   match the function rsims itself calls, so the two agree in any locale.
+#'
+#' @examples
+#' \dontrun{
+#' sim_wts <- sort_asset_cols(sim_wts)
+#' sim_prices <- sort_asset_cols(sim_prices)
+#' sim_unadjprices <- sort_asset_cols(sim_unadjprices)
+#' }
+sort_asset_cols <- function(m) {
+  if (!"date" %in% colnames(m)) stop("`m` must have a `date` column")
+  m[, c("date", sort(setdiff(colnames(m), "date"))), drop = FALSE]
+}
+
+#' Check the matrices and borrow vector handed to a backtest line up
+#'
+#' Cheap guard against the class of error `sort_asset_cols()` fixes: the three
+#' matrices must share a column order, and every asset must have a borrow rate.
+#'
+#' @param prices,unadjusted_prices,target_weights Wide matrices, `date` first.
+#' @param short_borrow_costs Optional named vector of borrow rates.
+#' @return Invisibly `TRUE`; errors with a specific message otherwise.
+check_sim_alignment <- function(prices, unadjusted_prices, target_weights,
+                                short_borrow_costs = NULL) {
+  if (!identical(colnames(prices), colnames(unadjusted_prices)))
+    stop("`prices` and `unadjusted_prices` have different column orders")
+  if (!identical(colnames(prices), colnames(target_weights)))
+    stop("`prices` and `target_weights` have different column orders")
+
+  tickers <- setdiff(colnames(prices), "date")
+  if (!identical(tickers, sort(tickers)))
+    warning("asset columns are not in sorted order; rsims applies name-sorted ",
+            "short_borrow_costs positionally. See sort_asset_cols().")
+
+  if (!is.null(short_borrow_costs)) {
+    missing <- setdiff(tickers, names(short_borrow_costs))
+    if (length(missing) > 0)
+      stop(length(missing),
+           if (length(missing) == 1) " asset has" else " assets have",
+           " no borrow rate: ", paste(utils::head(missing, 10), collapse = ", "),
+           if (length(missing) > 10) ", ..." else "")
+  }
+  invisible(TRUE)
+}
+
 #' Iterative weight capping preserving long/short balance
 #'
 #' Caps absolute weights at max_weight while maintaining the original
