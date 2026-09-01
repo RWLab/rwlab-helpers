@@ -231,7 +231,7 @@ apply_max_weight_ls <- function(df, max_weight = 0.05, max_iter = 20) {
     warning("Max iterations reached, some weights still exceed cap")
   }
 
-  df
+  df %>% arrange(date, ticker)
 }
 
 #' Calculate annualised Sharpe ratio from rsims backtest results
