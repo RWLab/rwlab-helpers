@@ -166,56 +166,104 @@ mean_pairwise_correlation <- function(ewma_cors, include_diagonal = TRUE) {
 
 # ── Hard weight constraints ─────────────────────────────────────────────────
 
-#' Apply a per-asset cap and a combined-group cap, then re-normalise
+#' Apply weight caps and redistribute the freed weight
 #'
-#' Two caps, applied to target weights before any trading:
+#' Two kinds of cap, in any combination:
 #'
-#' **Per-asset.** Inverse-volatility weighting hands the largest weight to the
-#' lowest-volatility asset, which in a multi-asset book is usually intermediate
-#' treasuries. Uncapped, that one name can drift past 40%.
+#' **Per-asset**, via `max_single`. A single number applies to every asset; a
+#' named vector sets different limits for different assets, and anything
+#' unnamed is uncapped.
 #'
-#' **Combined group.** The per-asset cap does not stop a whole *sleeve* taking
-#' over. When bond volatility is depressed across the curve, an uncapped book
-#' will happily hold 25% IEF, 15% TLT and 10% EMB and squeeze equities and gold
-#' down towards 30% between them. That is a duration and credit bet dressed up
-#' as a diversified portfolio, and only a joint cap prevents it.
+#' **Per-group**, via `groups`. Each entry names a set of tickers and a limit on
+#' their combined absolute weight. Any number of groups, and an asset may
+#' belong to more than one.
 #'
-#' When either cap binds, the freed weight is redistributed across the
-#' remaining non-capped, non-zero names in proportion to their current weight,
-#' so the book stays fully invested. This iterates, because each redistribution
-#' can push a previously flexible name onto its own cap.
+#' When a cap binds, the freed weight is redistributed across the names still
+#' free to receive it, in proportion to their current weight, so the book stays
+#' fully invested. **This has to iterate**, and that is the part a hand-rolled
+#' version usually gets wrong. Two ways to get it wrong:
 #'
-#' Names already at zero stay at zero. An asset the correlation tilt has
-#' dropped is not resurrected by the cap step.
+#' Renormalising everything at the end by dividing through by the total scales
+#' the capped group back up along with everything else, undoing the very cap
+#' you just applied. A group held to 35% of a book summing to 0.75 comes back
+#' as 46.7%.
+#'
+#' Giving the whole deficit to the names outside the group, pro rata, respects
+#' the group cap but can push one of those names past its own per-asset cap.
+#'
+#' The fix for both: only give weight to names that are free to take it, then
+#' look again, because some of them will no longer be free.
+#'
+#' Names already at zero stay at zero. An asset dropped upstream is not
+#' resurrected here.
 #'
 #' @param tickers Character vector, same order as `w`
-#' @param w Numeric weights for one date
-#' @param max_single Per-asset cap on absolute weight, or NULL for none
-#' @param max_group Combined cap on the group's absolute weight, or NULL
-#' @param group_tickers Which tickers the combined cap applies to
+#' @param w Numeric weights for a single date
+#' @param max_single Scalar, or named vector, or NULL for no per-asset cap
+#' @param groups List of `list(tickers = , max = )`, or NULL
+#' @param max_group,group_tickers Shorthand for a single group. Ignored if
+#'   `groups` is supplied.
 #' @param max_iter Safety stop on the redistribution loop
 #' @param tol Convergence tolerance
-#' @return Numeric vector of capped weights, same length as `w`
+#' @return Numeric vector of capped weights
+#' @examples
+#' tk <- c("EMB", "GLD", "IEF", "TLT", "VEA", "VTI", "VWO")
+#' w  <- c(0.18, 0.06, 0.26, 0.16, 0.06, 0.22, 0.06)
+#'
+#' # RW's published configuration
+#' apply_caps_and_normalise(tk, w, max_single = 0.25,
+#'                          max_group = 0.35, group_tickers = c("EMB","IEF","TLT"))
+#'
+#' # Your own: cap bonds harder, cap equities too, and let gold run
+#' apply_caps_and_normalise(tk, w,
+#'   max_single = c(EMB = 0.15, IEF = 0.15, TLT = 0.15, VTI = 0.30),
+#'   groups = list(
+#'     bonds    = list(tickers = c("EMB", "IEF", "TLT"), max = 0.30),
+#'     equities = list(tickers = c("VEA", "VTI", "VWO"), max = 0.50)
+#'   ))
 apply_caps_and_normalise <- function(tickers, w,
                                      max_single = NULL,
+                                     groups = NULL,
                                      max_group = NULL,
                                      group_tickers = c("EMB", "IEF", "TLT"),
                                      max_iter = 50, tol = 1e-10) {
-  if (is.null(max_single) && is.null(max_group)) return(w)
 
-  single <- if (is.null(max_single)) Inf else max_single
-  group  <- if (is.null(max_group))  Inf else max_group
+  # Shorthand for the single-group case.
+  if (is.null(groups) && !is.null(max_group)) {
+    groups <- list(list(tickers = group_tickers, max = max_group))
+  }
+  if (is.null(max_single) && length(groups) == 0) return(w)
 
-  group_mask <- tickers %in% group_tickers
+  n <- length(w)
+
+  # Per-asset limits, as a vector aligned to `tickers`.
+  single <- rep(Inf, n)
+  if (!is.null(max_single)) {
+    if (is.null(names(max_single))) {
+      if (length(max_single) != 1 && length(max_single) != n) {
+        stop("max_single must be a single number, a named vector, or one value per ticker")
+      }
+      single <- rep(max_single, length.out = n)
+    } else {
+      unknown <- setdiff(names(max_single), tickers)
+      if (length(unknown) > 0) {
+        stop(sprintf("max_single names not in tickers: %s", paste(unknown, collapse = ", ")))
+      }
+      single[match(names(max_single), tickers)] <- unname(max_single)
+    }
+  }
+
+  masks <- lapply(groups, function(g) tickers %in% g$tickers)
+  limits <- vapply(groups, function(g) g$max, numeric(1))
 
   for (iter in seq_len(max_iter)) {
     w_prev <- w
 
     w <- sign(w) * pmin(abs(w), single)
 
-    group_sum <- sum(abs(w[group_mask]))
-    if (group_sum > group) {
-      w[group_mask] <- w[group_mask] * (group / group_sum)
+    for (k in seq_along(masks)) {
+      s <- sum(abs(w[masks[[k]]]))
+      if (s > limits[k]) w[masks[[k]]] <- w[masks[[k]]] * (limits[k] / s)
     }
 
     total <- sum(abs(w))
@@ -228,10 +276,18 @@ apply_caps_and_normalise <- function(tickers, w,
       next
     }
 
-    abs_w         <- abs(w)
-    at_single_cap <- abs_w >= single - tol
-    group_at_cap  <- (sum(abs_w[group_mask]) >= group - tol) & group_mask
-    flexible      <- !at_single_cap & !group_at_cap & (abs_w > tol)
+    abs_w <- abs(w)
+
+    # Free to receive weight: below its own cap, in no group that is at its
+    # cap, and not already zero.
+    at_single <- abs_w >= single - tol
+    in_full_group <- rep(FALSE, n)
+    for (k in seq_along(masks)) {
+      if (sum(abs_w[masks[[k]]]) >= limits[k] - tol) {
+        in_full_group <- in_full_group | masks[[k]]
+      }
+    }
+    flexible <- !at_single & !in_full_group & (abs_w > tol)
 
     if (!any(flexible)) return(w)
 
