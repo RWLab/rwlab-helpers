@@ -163,3 +163,84 @@ mean_pairwise_correlation <- function(ewma_cors, include_diagonal = TRUE) {
     dplyr::ungroup() %>%
     dplyr::select(date, ticker, mean_pw_cor, port_mean_pw_cor, pw_cor_delta)
 }
+
+# ── Hard weight constraints ─────────────────────────────────────────────────
+
+#' Apply a per-asset cap and a combined-group cap, then re-normalise
+#'
+#' Two caps, applied to target weights before any trading:
+#'
+#' **Per-asset.** Inverse-volatility weighting hands the largest weight to the
+#' lowest-volatility asset, which in a multi-asset book is usually intermediate
+#' treasuries. Uncapped, that one name can drift past 40%.
+#'
+#' **Combined group.** The per-asset cap does not stop a whole *sleeve* taking
+#' over. When bond volatility is depressed across the curve, an uncapped book
+#' will happily hold 25% IEF, 15% TLT and 10% EMB and squeeze equities and gold
+#' down towards 30% between them. That is a duration and credit bet dressed up
+#' as a diversified portfolio, and only a joint cap prevents it.
+#'
+#' When either cap binds, the freed weight is redistributed across the
+#' remaining non-capped, non-zero names in proportion to their current weight,
+#' so the book stays fully invested. This iterates, because each redistribution
+#' can push a previously flexible name onto its own cap.
+#'
+#' Names already at zero stay at zero. An asset the correlation tilt has
+#' dropped is not resurrected by the cap step.
+#'
+#' @param tickers Character vector, same order as `w`
+#' @param w Numeric weights for one date
+#' @param max_single Per-asset cap on absolute weight, or NULL for none
+#' @param max_group Combined cap on the group's absolute weight, or NULL
+#' @param group_tickers Which tickers the combined cap applies to
+#' @param max_iter Safety stop on the redistribution loop
+#' @param tol Convergence tolerance
+#' @return Numeric vector of capped weights, same length as `w`
+apply_caps_and_normalise <- function(tickers, w,
+                                     max_single = NULL,
+                                     max_group = NULL,
+                                     group_tickers = c("EMB", "IEF", "TLT"),
+                                     max_iter = 50, tol = 1e-10) {
+  if (is.null(max_single) && is.null(max_group)) return(w)
+
+  single <- if (is.null(max_single)) Inf else max_single
+  group  <- if (is.null(max_group))  Inf else max_group
+
+  group_mask <- tickers %in% group_tickers
+
+  for (iter in seq_len(max_iter)) {
+    w_prev <- w
+
+    w <- sign(w) * pmin(abs(w), single)
+
+    group_sum <- sum(abs(w[group_mask]))
+    if (group_sum > group) {
+      w[group_mask] <- w[group_mask] * (group / group_sum)
+    }
+
+    total <- sum(abs(w))
+    if (total < tol) return(w)
+    if (abs(total - 1) < tol) return(w)
+    deficit <- 1 - total
+
+    if (deficit < 0) {
+      w <- w / total
+      next
+    }
+
+    abs_w         <- abs(w)
+    at_single_cap <- abs_w >= single - tol
+    group_at_cap  <- (sum(abs_w[group_mask]) >= group - tol) & group_mask
+    flexible      <- !at_single_cap & !group_at_cap & (abs_w > tol)
+
+    if (!any(flexible)) return(w)
+
+    flex_sum <- sum(abs_w[flexible])
+    w[flexible] <- w[flexible] * ((flex_sum + deficit) / flex_sum)
+
+    if (max(abs(w - w_prev)) < tol) return(w)
+  }
+
+  warning("apply_caps_and_normalise: max_iter reached without converging")
+  w
+}
