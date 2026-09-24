@@ -1,11 +1,12 @@
 # statarb_helpers.R
 # Shared utility functions for the stat-arb research notebooks
-# Source via: source("https://raw.githubusercontent.com/RWLab/rwlab-helpers/main/R/statarb_helpers.R")
+# Source via: source("https://raw.githubusercontent.com/RWLab/rwlab-helpers/master/R/statarb_helpers.R")
 #
 # Contains only generic, non-proprietary functions:
 #   - Data loading and processing
 #   - Portfolio math helpers
 #   - Commission presets
+#   - Signal gating (a generic two-gate latch; the thresholds stay in the notebooks)
 #
 # Signal construction, weight calculation, and strategy logic stay in the notebooks.
 
@@ -93,6 +94,69 @@ load_statarb_data <- function(pod = "EquityFactors",
     acquisitions = acquisitions,
     short_borrow = short_borrow
   )
+}
+
+# ── Gating ──────────────────────────────────────────────────────────────────
+
+#' Path-dependent hold state from two logical gates (hysteresis)
+#'
+#' A name is held from the first day it clears the *entry* gate until the first
+#' day it fails the *exit* gate. Leaving the panel (a gap in trading days for
+#' that ticker) resets it: you cannot hold what the book did not select, and a
+#' returning name has to re-qualify on entry. With `.in_ok` equal to `.out_ok`
+#' this is an ordinary hard gate, so it is safe to apply unconditionally.
+#'
+#' Implemented without a per-ticker loop: inside each run of consecutive
+#' trading days that clear the exit gate, the name is held from the point the
+#' entry gate first fires. A `cumsum` for run ids and a `cummax` within them.
+#' An NA gate counts as failing.
+#'
+#' @param df A data frame with `date`, `ticker` and two logical columns:
+#'   `.in_ok` (entry gate cleared today) and `.out_ok` (exit gate cleared
+#'   today). Every other column passes through untouched.
+#' @param calendar_idx The trading calendar: a data frame with `trading_date`
+#'   and an integer `t_idx` (1 for the first trading day, 2 for the next, ...).
+#'   It is what tells a weekend apart from a day the ticker was out of the panel.
+#' @return `df` with a logical `held` column added and the two gate columns
+#'   removed, in the caller's row order. A date absent from `calendar_idx` is
+#'   isolated: it is held only if it clears the entry gate itself, and it
+#'   carries no state into the next row.
+#'
+#' @examples
+#' \dontrun{
+#' ts %>%
+#'   mutate(.in_ok  = abs(mean_zscore) >= 0.5,
+#'          .out_ok = abs(mean_zscore) >= 0.25) %>%
+#'   hold_state(trading_calendar_idx)
+#' }
+hold_state <- function(df, calendar_idx) {
+  stopifnot(all(c("date", "ticker", ".in_ok", ".out_ok") %in% names(df)),
+            all(c("trading_date", "t_idx") %in% names(calendar_idx)))
+  if (anyDuplicated(calendar_idx$trading_date))
+    stop("calendar_idx has duplicated trading_date values; each trading day must appear once")
+
+  df %>%
+    ungroup() %>%
+    mutate(.row = row_number()) %>%
+    left_join(calendar_idx %>% select(trading_date, .t_idx = t_idx),
+              by = c("date" = "trading_date")) %>%
+    arrange(ticker, .t_idx) %>%
+    group_by(ticker) %>%
+    mutate(
+      .in_ok  = coalesce(.in_ok, FALSE),
+      .out_ok = coalesce(.out_ok, FALSE),
+      # a run breaks when today fails the exit gate, or yesterday's trading day
+      # is not the previous row for this ticker (a gap in the panel, or a date
+      # the calendar does not know)
+      .brk = !.out_ok | is.na(.t_idx) | is.na(lag(.t_idx)) | (.t_idx - lag(.t_idx)) != 1L,
+      .brk = coalesce(.brk, TRUE),
+      .run = cumsum(.brk)
+    ) %>%
+    group_by(ticker, .run) %>%
+    mutate(held = .out_ok & cummax(as.integer(.in_ok)) == 1L) %>%
+    ungroup() %>%
+    arrange(.row) %>%
+    select(-.row, -.t_idx, -.brk, -.run, -.in_ok, -.out_ok)
 }
 
 # ── Short Borrow Aggregation ────────────────────────────────────────────────
